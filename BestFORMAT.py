@@ -1,0 +1,954 @@
+# modules/BestFORMAT.py
+# -*- coding: utf-8 -*-
+import asyncio
+import sqlite3
+import os
+import tempfile
+import io
+import textwrap
+import re
+import traceback
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from pilmoji import Pilmoji
+from pilmoji.source import AppleEmojiSource
+from telethon.tl.types import Message
+from telethon.tl.custom import Message as CustomMessage
+
+from .. import loader, utils
+
+# Используем временную директорию для БД
+DB_PATH = os.path.join(tempfile.gettempdir(), "BestTextFormat21.db")
+LOG_PATH = os.path.join(tempfile.gettempdir(), "BestTextFormat2_logs.txt")
+
+# Цветовая палитра
+COLORS = {
+    "red": (255, 80, 80),
+    "green": (80, 255, 80),
+    "blue": (80, 80, 255),
+    "yellow": (255, 255, 80),
+    "cyan": (80, 255, 255),
+    "magenta": (255, 80, 255),
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "gray": (160, 160, 160),
+    "orange": (255, 165, 0),
+    "purple": (160, 80, 255),
+    "pink": (255, 180, 200),
+    "brown": (160, 100, 50),
+    "gold": (255, 215, 0),
+    "silver": (192, 192, 192)
+}
+
+# Стандартные цвета по умолчанию
+DEFAULT_COLORS = {
+    "title": (100, 150, 255),
+    "text": (220, 220, 220),
+    "and": (150, 150, 150)
+}
+
+@loader.tds
+class BestTextFormat2(loader.Module):
+    """Модуль для автоматического форматирования сообщений"""
+    strings = {"name": "BestFORMAT"}
+
+    async def client_ready(self, client, db):
+        self.client = client
+        self.db = db
+        self.logging_enabled = False
+        self._init_db()
+        self._load_settings()
+        self.processed_messages = set()
+        # Инициализируем множество для хранения ID сообщений от спамера
+        if not hasattr(self.client, '_spam_message_ids'):
+            self.client._spam_message_ids = set()
+        self._log("✅ Модуль загружен")
+
+    def _log(self, message, error=False):
+        """Запись лога в файл"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {'❌' if error else '📝'} {message}\n"
+        print(log_entry.strip())
+        if self.logging_enabled:
+            try:
+                with open(LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(log_entry)
+            except Exception as e:
+                print(f"Ошибка записи лога: {e}")
+
+    def _init_db(self):
+        """Инициализация SQLite базы данных"""
+        global DB_PATH
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('CREATE TABLE IF NOT EXISTS BestTextFormat2 (key TEXT PRIMARY KEY, value TEXT)')
+            conn.commit()
+            conn.close()
+            self._log(f"✅ БД инициализирована: {DB_PATH}")
+        except Exception as e:
+            self._log(f"❌ Ошибка БД: {e}", error=True)
+            DB_PATH = ":memory:"
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('CREATE TABLE IF NOT EXISTS BestTextFormat2 (key TEXT PRIMARY KEY, value TEXT)')
+            conn.commit()
+            conn.close()
+            self._log("⚠️ Используется БД в памяти")
+        
+        self._init_placeholders_db()
+        self._init_backgrounds_db()
+
+    def _init_placeholders_db(self):
+        """Инициализация таблицы для плейсхолдеров"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('CREATE TABLE IF NOT EXISTS placeholders (key TEXT PRIMARY KEY, value TEXT, color TEXT)')
+        conn.commit()
+        conn.close()
+
+    def _init_backgrounds_db(self):
+        """Инициализация таблицы для фоновых изображений (только для text)"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('CREATE TABLE IF NOT EXISTS backgrounds (key TEXT PRIMARY KEY, value BLOB)')
+        conn.commit()
+        conn.close()
+
+    def _save_setting(self, key, value):
+        """Сохранить настройку в БД"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO BestTextFormat2 (key, value) VALUES (?, ?)', (key, value))
+        conn.commit()
+        conn.close()
+
+    def _load_setting(self, key, default=None):
+        """Загрузить настройку из БД"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT value FROM BestTextFormat2 WHERE key = ?', (key,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else default
+
+    def _load_settings(self):
+        """Загрузить все настройки"""
+        self.format_pattern = self._load_setting("format_pattern")
+        self.enabled = self._load_setting("enabled") == "True"
+        self.enabled_type = self._load_setting("enabled_type")
+        self.vformat_template = self._load_setting("vformat_template")
+        self.logging_enabled = self._load_setting("log_enabled") == "True"
+        
+        # Загружаем список игнорируемых символов (храним как строку через разделитель)
+        no_symbols_str = self._load_setting("no_symbols", "")
+        self.no_symbols = [s for s in no_symbols_str.split(",") if s] if no_symbols_str else []
+        
+        self.placeholders = {
+            "title": self._load_placeholder("title"),
+            "text": self._load_placeholder("text"),
+            "and": self._load_placeholder("and")
+        }
+        
+        self.text_background = self._load_background("text")
+        
+        self._log(f"📊 Настройки загружены: enabled={self.enabled}, type={self.enabled_type}")
+        self._log(f"📊 Игнорируемые символы: {self.no_symbols}")
+
+    def _save_placeholder(self, key, value, color=None):
+        """Сохранить плейсхолдер с цветом"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO placeholders (key, value, color) VALUES (?, ?, ?)', (key, value, color))
+        conn.commit()
+        conn.close()
+        self.placeholders[key] = {"text": value, "color": color}
+        self._log(f"📝 Плейсхолдер {key} сохранён (цвет: {color})")
+
+    def _load_placeholder(self, key):
+        """Загрузить плейсхолдер с цветом"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT value, color FROM placeholders WHERE key = ?', (key,))
+        row = c.fetchone()
+        conn.close()
+        return {"text": row[0] if row else "", "color": row[1] if row else None}
+
+    def _save_background(self, key, value):
+        """Сохранить фоновое изображение (только для text)"""
+        if key != "text":
+            self._log(f"⚠️ Фон можно установить только для text")
+            return
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO backgrounds (key, value) VALUES (?, ?)', (key, value))
+        conn.commit()
+        conn.close()
+        self.text_background = value
+        self._log(f"🖼️ Фон для text сохранён")
+
+    def _load_background(self, key):
+        """Загрузить фоновое изображение"""
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT value FROM backgrounds WHERE key = ?', (key,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def _apply_background_to_text_area(self, image, bg_data, area_height, y_offset, width):
+        """Применить фон к области text с заполнением"""
+        if not bg_data:
+            return image
+        
+        try:
+            bg = Image.open(io.BytesIO(bg_data))
+            bg = bg.resize((width, area_height), Image.Resampling.LANCZOS)
+            image.paste(bg, (0, y_offset))
+        except Exception as e:
+            self._log(f"Ошибка применения фона: {e}", error=True)
+        return image
+
+    def _parse_color_tags(self, text):
+        """Парсит цветовые теги в тексте"""
+        if not text:
+            return [("default", "")]
+        
+        tag_pattern = r'<(/?)(red|green|blue|yellow|cyan|magenta|white|black|gray|orange|purple|pink|gold|silver)>'
+        
+        result = []
+        stack = []
+        last_end = 0
+        
+        for match in re.finditer(tag_pattern, text, re.IGNORECASE):
+            if match.start() > last_end:
+                current_color = stack[-1] if stack else "default"
+                result.append((current_color, text[last_end:match.start()]))
+            
+            is_closing = match.group(1) == '/'
+            color = match.group(2).lower()
+            
+            if not is_closing:
+                stack.append(color)
+            else:
+                if stack and stack[-1] == color:
+                    stack.pop()
+            
+            last_end = match.end()
+        
+        if last_end < len(text):
+            current_color = stack[-1] if stack else "default"
+            result.append((current_color, text[last_end:]))
+        
+        return [(c, t) for c, t in result if t.strip() or t == ""]
+
+    def _get_color_rgb(self, color_name, default_color):
+        """Получить RGB значение цвета"""
+        if not color_name or color_name == "default":
+            return default_color
+        return COLORS.get(color_name, default_color)
+
+    def _get_text_width(self, text, font):
+        """Получить ширину текста (приблизительно)"""
+        return len(text) * 14
+
+    def _parse_vformat_template(self, template):
+        """Парсит шаблон для генерации изображения (формат: head_название\body_название\legs_название)"""
+        if not template:
+            return {"title": "", "text": "", "and": ""}
+        
+        lines = template.strip().split('\n')
+        result = {"title": "", "text": "", "and": ""}
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith("head_"):
+                result["title"] = line[5:]
+            elif line.startswith("body_"):
+                result["text"] = line[5:]
+            elif line.startswith("legs_"):
+                result["and"] = line[5:]
+        
+        return result
+
+    def _is_spam_message(self, message):
+        """Проверяет, является ли сообщение от спамера (по ID)"""
+        if not message:
+            return False
+        spam_ids = getattr(self.client, '_spam_message_ids', set())
+        return message.id in spam_ids
+
+    async def _generate_image(self, text):
+        """Генерирует изображение с текстом (скопировано из версии 1)"""
+        try:
+            self._log(f"🖼️ Генерация фото для: {text[:50]}...")
+            
+            width = 800
+            padding = 40
+            line_height = 38
+            
+            if not self.vformat_template:
+                self._log("❌ Нет шаблона", error=True)
+                return None
+            
+            template_data = self._parse_vformat_template(self.vformat_template)
+            
+            # Получаем данные плейсхолдеров по именам из шаблона
+            title_data = self.placeholders.get(template_data["title"], {"text": "", "color": None})
+            text_data = self.placeholders.get(template_data["text"], {"text": "", "color": None})
+            and_data = self.placeholders.get(template_data["and"], {"text": "", "color": None})
+            
+            # Формируем текст для body, подставляя текст пользователя вместо {}
+            if text_data["text"]:
+                body_text = text_data["text"].replace("{}", text)
+            else:
+                body_text = text
+            
+            # Загружаем шрифты
+            try:
+                font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+                font_text = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+                font_footer = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+            except:
+                try:
+                    font_title = ImageFont.truetype("arialbd.ttf", 32)
+                    font_text = ImageFont.truetype("arial.ttf", 24)
+                    font_footer = ImageFont.truetype("arialbd.ttf", 28)
+                except:
+                    font_title = ImageFont.load_default()
+                    font_text = ImageFont.load_default()
+                    font_footer = ImageFont.load_default()
+            
+            # Стандартная высота части body - 16 строк
+            DEFAULT_BODY_LINES = 16
+            BODY_LINE_HEIGHT = line_height
+            STANDARD_BODY_HEIGHT = DEFAULT_BODY_LINES * BODY_LINE_HEIGHT + 10
+            
+            # Вычисляем реальную высоту текста
+            if body_text:
+                wrapped_lines = []
+                for line in body_text.split('\n'):
+                    if line:
+                        wrapped_lines.extend(textwrap.wrap(line, width=45))
+                    else:
+                        wrapped_lines.append('')
+                actual_text_lines = len(wrapped_lines)
+                text_height = max(STANDARD_BODY_HEIGHT, actual_text_lines * BODY_LINE_HEIGHT + 10)
+                actual_wrapped_lines = wrapped_lines
+            else:
+                text_height = STANDARD_BODY_HEIGHT
+                actual_wrapped_lines = []
+            
+            # Высота заголовка
+            title_height = 50 if title_data["text"] else 0
+            
+            # Высота подвала
+            if and_data["text"]:
+                and_lines = and_data["text"].split('\n')
+                and_height = len(and_lines) * 40
+            else:
+                and_height = 0
+            
+            # Общая высота
+            total_height = 30 + title_height + 3 + 25 + text_height + 25 + 3 + and_height + 30
+            height = max(500, total_height)
+            
+            # Создаём изображение
+            image = Image.new('RGB', (width, height), color='#1a1a2e')
+            draw = ImageDraw.Draw(image)
+            
+            y_offset = 30
+            
+            # ========== TITLE СЕКЦИЯ ==========
+            if title_data["text"]:
+                title_color = DEFAULT_COLORS["title"]
+                if title_data["color"]:
+                    title_color = COLORS.get(title_data["color"], DEFAULT_COLORS["title"])
+                
+                with Pilmoji(image, source=AppleEmojiSource) as pilmoji:
+                    text_width = len(title_data["text"]) * 14
+                    x_pos = (width - text_width) // 3
+                    x_pos = max(padding, min(x_pos, width - text_width - padding))
+                    pilmoji.text((x_pos, y_offset), title_data["text"], fill=title_color, font=font_title)
+                
+                y_offset += 50
+                y_offset += 3
+                draw.line([(0, y_offset), (width, y_offset)], fill=(100, 100, 100), width=2)
+                y_offset += 0
+            
+            # ========== TEXT СЕКЦИЯ ==========
+            text_start_y = y_offset
+            
+            if body_text:
+                if self.text_background:
+                    image = self._apply_background_to_text_area(image, self.text_background, text_height, text_start_y, width)
+                
+                text_color = DEFAULT_COLORS["text"]
+                if text_data["color"]:
+                    text_color = COLORS.get(text_data["color"], DEFAULT_COLORS["text"])
+                
+                text_y_offset = text_start_y + 25
+                
+                with Pilmoji(image, source=AppleEmojiSource) as pilmoji:
+                    current_y = text_y_offset
+                    for line in actual_wrapped_lines:
+                        colored_parts = self._parse_color_tags(line)
+                        x_offset = padding
+                        for color_name, part_text in colored_parts:
+                            if part_text:
+                                color = self._get_color_rgb(color_name, text_color)
+                                pilmoji.text((x_offset, current_y), part_text, fill=color, font=font_text)
+                                x_offset += len(part_text) * 14
+                        current_y += BODY_LINE_HEIGHT
+            
+            y_offset = text_start_y + text_height
+            draw.line([(0, y_offset), (width, y_offset)], fill=(100, 100, 100), width=2)
+            y_offset += 3
+            
+            # ========== AND СЕКЦИЯ ==========
+            if and_data["text"]:
+                and_color = DEFAULT_COLORS["and"]
+                if and_data["color"]:
+                    and_color = COLORS.get(and_data["color"], DEFAULT_COLORS["and"])
+                
+                and_lines = and_data["text"].split('\n')
+                
+                with Pilmoji(image, source=AppleEmojiSource) as pilmoji:
+                    current_y = height - len(and_lines) * 40 - 30
+                    for line in and_lines:
+                        text_width = len(line) * 12
+                        x_center = (width - text_width) // 2
+                        x_pos = max(padding, min(x_center, width - text_width - padding))
+                        pilmoji.text((x_pos, current_y), line, fill=and_color, font=font_footer)
+                        current_y += 40
+            
+            img_bytes = io.BytesIO()
+            image.save(img_bytes, format='JPEG', quality=95)
+            img_bytes.seek(0)
+            img_bytes.name = "formatted_image.jpg"
+            
+            self._log(f"✅ Фото создано! Размер: {len(img_bytes.getvalue())} bytes")
+            return img_bytes
+            
+        except Exception as e:
+            self._log(f"❌ Ошибка: {str(e)}", error=True)
+            self._log(traceback.format_exc(), error=True)
+            return None
+
+    def _should_ignore(self, message):
+        """Проверяет, нужно ли игнорировать сообщение"""
+        if not message or not message.text:
+            return False
+        
+        # Проверяем, не от спамера ли сообщение (по ID)
+        if self._is_spam_message(message):
+            self._log(f"⏭️ Пропуск сообщения от спамера (ID: {message.id})")
+            return True
+        
+        # Проверяем символы игнорирования
+        for symbol in self.no_symbols:
+            if message.text.startswith(symbol):
+                return True
+        return False
+
+    @loader.watcher(out=True, only_messages=True)
+    async def format_watcher(self, message: Message):
+        """Ватчер для автоматического форматирования"""
+        try:
+            if not self.enabled or not self.enabled_type:
+                return
+            
+            if not message.text:
+                return
+            
+            # Пропускаем команды модуля
+            if message.text.startswith('.'):
+                cmd = message.text.split()[0] if ' ' in message.text else message.text
+                if cmd in ['.form_logs', '.photo', '.no', '.tformat', '.pf', '.vformat', '.place', '.clearformat']:
+                    return
+            
+            # Проверяем символы игнорирования и сообщения от спамера
+            if self._should_ignore(message):
+                return
+            
+            msg_id = f"{message.chat_id}_{message.id}"
+            if msg_id in self.processed_messages:
+                return
+            
+            self.processed_messages.add(msg_id)
+            
+            # Текстовое форматирование
+            if self.enabled_type == "text" and self.format_pattern:
+                formatted_text = self.format_pattern.replace("{}", message.text).replace("\\n", "\n")
+                if formatted_text != message.text:
+                    await message.edit(formatted_text, parse_mode="html")
+                    self._log(f"✅ Текст: {message.text[:30]}")
+            
+            # Визуальное форматирование (фото)
+            elif self.enabled_type == "photo" and self.vformat_template:
+                self._log(f"📸 Обработка: {message.text[:50]}")
+                img_data = await self._generate_image(message.text)
+                
+                if img_data:
+                    reply_to = message.reply_to_msg_id
+                    await message.delete()
+                    
+                    if reply_to:
+                        await self.client.send_file(
+                            message.chat_id,
+                            img_data,
+                            caption=None,
+                            reply_to=reply_to
+                        )
+                    else:
+                        await self.client.send_file(
+                            message.chat_id,
+                            img_data,
+                            caption=None
+                        )
+                    self._log(f"✅ Фото отправлено" + (" с реплаем" if reply_to else ""))
+                else:
+                    self._log(f"❌ Не удалось создать фото", error=True)
+                    self.processed_messages.discard(msg_id)
+            
+            # Очищаем множество ID спамеров (чтобы не разрасталось)
+            if len(getattr(self.client, '_spam_message_ids', set())) > 1000:
+                self.client._spam_message_ids = set()
+            
+            asyncio.create_task(self._remove_from_processed(msg_id, 5))
+                
+        except Exception as e:
+            self._log(f"❌ Ошибка: {e}", error=True)
+            self._log(traceback.format_exc(), error=True)
+
+    async def _remove_from_processed(self, msg_id, delay):
+        await asyncio.sleep(delay)
+        self.processed_messages.discard(msg_id)
+
+    @loader.command()
+    async def form_logs(self, message: CustomMessage):
+        """📋 - управление логами модуля
+        
+        Использование:
+        .form_logs -on   - включить запись логов
+        .form_logs -off  - выключить запись логов
+        .form_logs -view - отправить файл с логами
+        .form_logs -clear - очистить файл логов"""
+        
+        args = utils.get_args_raw(message).strip().lower()
+        
+        if not args:
+            status = "включена" if self.logging_enabled else "выключена"
+            await utils.answer(message, 
+                f"📋 <b>Управление логами модуля</b>\n\n"
+                f"Статус: {'✅ Включена' if self.logging_enabled else '❌ Выключена'}\n\n"
+                f"<b>Команды:</b>\n"
+                f"<code>.form_logs -on</code> - включить логи\n"
+                f"<code>.form_logs -off</code> - выключить логи\n"
+                f"<code>.form_logs -view</code> - просмотреть логи\n"
+                f"<code>.form_logs -clear</code> - очистить логи",
+                parse_mode="html")
+            return
+        
+        if args == "-on":
+            self.logging_enabled = True
+            self._save_setting("log_enabled", "True")
+            self._log("📋 Логирование включено")
+            await utils.answer(message, "✅ <b>Логирование ВКЛЮЧЕНО!</b>\n\nТеперь все действия модуля записываются в лог.", parse_mode="html")
+        
+        elif args == "-off":
+            self.logging_enabled = False
+            self._save_setting("log_enabled", "False")
+            await utils.answer(message, "❌ <b>Логирование ВЫКЛЮЧЕНО!</b>", parse_mode="html")
+        
+        elif args == "-view":
+            if not os.path.exists(LOG_PATH):
+                await utils.answer(message, "📋 <b>Логи отсутствуют</b>\n\nФайл с логами пока не создан.", parse_mode="html")
+                return
+            
+            try:
+                with open(LOG_PATH, "rb") as f:
+                    log_data = f.read()
+                
+                if len(log_data) == 0:
+                    await utils.answer(message, "📋 <b>Логи пусты</b>\n\nФайл с логами существует, но пуст.", parse_mode="html")
+                    return
+                
+                await message.client.send_file(
+                    message.chat_id,
+                    io.BytesIO(log_data),
+                    caption=f"📋 Логи модуля BestFORMAT\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    file_name=f"BestFORMAT_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                )
+                await message.delete()
+                self._log("📋 Отправлен файл с логами")
+            except Exception as e:
+                await utils.answer(message, f"❌ <b>Ошибка:</b> {str(e)}", parse_mode="html")
+        
+        elif args == "-clear":
+            try:
+                if os.path.exists(LOG_PATH):
+                    with open(LOG_PATH, "w") as f:
+                        f.write(f"Логи очищены: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    self._log("📋 Логи очищены")
+                await utils.answer(message, "✅ <b>Логи очищены!</b>", parse_mode="html")
+            except Exception as e:
+                await utils.answer(message, f"❌ <b>Ошибка:</b> {str(e)}", parse_mode="html")
+        
+        else:
+            await utils.answer(message, f"❌ <b>Неверный аргумент!</b>\n\nДоступно: -on, -off, -view, -clear", parse_mode="html")
+
+    @loader.command()
+    async def photo(self, message: CustomMessage):
+        """🖼️ - установить фоновое изображение для текста (только реплай на фото)
+        
+        Использование: .photo text (реплай на фото)
+        
+        Пример: .photo text - установит фон для основного текста
+        Фон будет растянут на всю область текста между линиями-разделителями"""
+        
+        if not message.is_reply:
+            await utils.answer(message, "❌ <b>Ошибка:</b> Команда должна быть реплаем на фото!", parse_mode="html")
+            return
+        
+        args = utils.get_args_raw(message).strip().lower()
+        if args != "text":
+            await utils.answer(message, f"❌ <b>Ошибка:</b> Фон можно установить только для 'text'!\nИспользуйте: <code>.photo text</code>", parse_mode="html")
+            return
+        
+        reply_msg = await message.get_reply_message()
+        if not reply_msg.photo:
+            await utils.answer(message, "❌ <b>Ошибка:</b> Реплай должен быть на фото!", parse_mode="html")
+            return
+        
+        photo_data = await reply_msg.download_media(bytes)
+        self._save_background("text", photo_data)
+        
+        await utils.answer(message, f"✅ <b>Фоновое изображение для текста установлено!</b>\n\nФон будет отображаться между линиями-разделителями.", parse_mode="html")
+
+    @loader.command()
+    async def no(self, message: CustomMessage):
+        """🚫 - управление символами игнорирования форматирования
+        
+        Сообщения, начинающиеся с любого из установленных символов, НЕ будут форматироваться.
+        Команды модуля (с .) НЕ игнорируются этими символами.
+        
+        Использование:
+        .no !          - установить один символ '!'
+        .no            - показать текущие символы
+        .no off        - удалить все символы
+        (многострочно) - установить несколько символов:
+        .no
+        !
+        @
+        #
+        $"""
+        
+        args = utils.get_args_raw(message).strip()
+        
+        # Многострочный режим (если есть переводы строк)
+        if '\n' in args:
+            symbols = [line.strip() for line in args.split('\n') if line.strip()]
+            if not symbols:
+                await utils.answer(message, "❌ <b>Ошибка:</b> Не указаны символы!", parse_mode="html")
+                return
+            
+            # Проверяем, что все символы - одиночные
+            invalid = [s for s in symbols if len(s) != 1]
+            if invalid:
+                await utils.answer(message, f"❌ <b>Ошибка:</b> Каждый символ должен быть одиночным!\nНеверно: {', '.join(invalid)}", parse_mode="html")
+                return
+            
+            self.no_symbols = symbols
+            self._save_setting("no_symbols", ",".join(symbols))
+            await utils.answer(message, f"✅ <b>Установлено {len(symbols)} символов игнорирования:</b>\n<code>{' '.join(symbols)}</code>\n\nСообщения, начинающиеся с любого из этих символов, НЕ будут форматироваться.", parse_mode="html")
+            return
+        
+        # Обычный режим (одна строка)
+        if not args:
+            if not self.no_symbols:
+                await utils.answer(message, "🚫 <b>Символы игнорирования не установлены</b>\n\n<code>.no !</code> - установить один символ\n<code>.no</code> (с новой строки) - установить несколько символов\n<code>.no off</code> - удалить все", parse_mode="html")
+            else:
+                await utils.answer(message, f"🚫 <b>Текущие символы игнорирования:</b>\n<code>{' '.join(self.no_symbols)}</code>\n\nСообщения, начинающиеся с любого из этих символов, НЕ будут форматироваться.\n\n<code>.no off</code> - удалить все", parse_mode="html")
+            return
+        
+        if args.lower() == "off":
+            self.no_symbols = []
+            self._save_setting("no_symbols", "")
+            await utils.answer(message, f"✅ <b>Все символы игнорирования удалены!</b>\n\nВсе сообщения будут форматироваться.", parse_mode="html")
+            return
+        
+        # Установка одного символа
+        if len(args) != 1:
+            await utils.answer(message, f"❌ <b>Ошибка:</b> Для установки одного символа укажите его.\nДля установки нескольких используйте многострочный формат:\n<code>.no\\n!\\n@\\n#</code>", parse_mode="html")
+            return
+        
+        self.no_symbols = [args]
+        self._save_setting("no_symbols", args)
+        await utils.answer(message, f"✅ <b>Символ игнорирования установлен:</b> <code>{args}</code>\n\nСообщения, начинающиеся с <code>{args}</code>, НЕ будут форматироваться.", parse_mode="html")
+
+    @loader.command()
+    async def tformat(self, message: CustomMessage):
+        """✏️ - установить шаблон текстового форматирования
+        
+        Примеры:
+        .tformat 📱<b>{}</b>📱
+        .tformat <i>Текст:</i>\\n{}
+        .tformat 🔥 {} 🔥
+        
+        {} - место для текста сообщения
+        \\n - перенос строки
+        Поддерживается HTML: <b>, <i>, <code>, <a>, <tg-emoji>"""
+        
+        args = utils.get_args_raw(message)
+        
+        if not args:
+            current = self.format_pattern if self.format_pattern else "не установлен"
+            status = "✅ Включён" if (self.enabled and self.enabled_type == "text") else "❌ Выключен"
+            await utils.answer(message, 
+                f"💬 <b>Текущий шаблон текстового форматирования:</b>\n"
+                f"<code>{current}</code>\n\n"
+                f"✨ <b>Статус:</b> {status}\n\n"
+                f"<b>Использование:</b> <code>.tformat &lt;шаблон&gt;</code>\n"
+                f"<b>Пример:</b> <code>.tformat 📱&lt;b&gt;{{}}&lt;/b&gt;📱</code>\n"
+                f"<b>Где {{}}</b> - место для текста сообщения\n\n"
+                f"<b>Для включения:</b> <code>.pf -text</code>", 
+                parse_mode="html")
+            return
+        
+        self.format_pattern = args
+        self._save_setting("format_pattern", args)
+        await utils.answer(message, f"✅ <b>Шаблон текстового форматирования сохранён!</b>\n\n<b>Включите:</b> <code>.pf -text</code>", parse_mode="html")
+
+    @loader.command()
+    async def pf(self, message: CustomMessage):
+        """⚙️ - управление форматированием
+        
+        Использование:
+        .pf -text   - включить текстовое форматирование
+        .pf -photo  - включить визуальное форматирование (генерация фото)
+        .pf         - выключить любое активное форматирование"""
+        
+        args = utils.get_args_raw(message).strip()
+        
+        if not args:
+            if not self.enabled:
+                await utils.answer(message, 
+                    f"❌ <b>Форматирование выключено!</b>\n\n"
+                    f"<b>Включить текстовое:</b> <code>.pf -text</code>\n"
+                    f"<b>Включить визуальное:</b> <code>.pf -photo</code>", 
+                    parse_mode="html")
+                return
+            
+            old_type = self.enabled_type
+            self.enabled = False
+            self.enabled_type = None
+            self._save_setting("enabled", "False")
+            self._save_setting("enabled_type", "")
+            
+            type_name = "текстовое" if old_type == "text" else "визуальное"
+            await utils.answer(message, f"❌ <b>{type_name.capitalize()} форматирование ВЫКЛЮЧЕНО!</b>", parse_mode="html")
+            return
+        
+        if args == "-text":
+            if not self.format_pattern:
+                await utils.answer(message, 
+                    f"❌ <b>Ошибка:</b> Сначала установите шаблон текстового форматирования!\n"
+                    f"Используйте: <code>.tformat &lt;шаблон&gt;</code>\n"
+                    f"<b>Пример:</b> <code>.tformat 📱&lt;b&gt;{{}}&lt;/b&gt;📱</code>", 
+                    parse_mode="html")
+                return
+            
+            self.enabled = True
+            self.enabled_type = "text"
+            self._save_setting("enabled", "True")
+            self._save_setting("enabled_type", "text")
+            await utils.answer(message, 
+                f"✅ <b>Текстовое форматирование ВКЛЮЧЕНО!</b>\n\n"
+                f"💬 <b>Шаблон:</b> <code>{self.format_pattern}</code>\n\n"
+                f"❗️ Теперь все ваши сообщения будут автоматически форматироваться.\n"
+                f"🔄 Команды не форматируются.\n\n"
+                f"<b>Чтобы выключить:</b> <code>.pf</code>\n"
+                f"<b>Переключиться на визуальное:</b> <code>.pf -photo</code>", 
+                parse_mode="html")
+        
+        elif args == "-photo":
+            if not self.vformat_template:
+                await utils.answer(message, 
+                    f"❌ <b>Ошибка:</b> Сначала настройте визуальное форматирование!\n\n"
+                    f"<b>Шаги для настройки:</b>\n"
+                    f"1. Установите плейсхолдеры: <code>.place title Ваш заголовок</code>\n"
+                    f"2. Установите шаблон: <code>.vformat title_title\\ntext_text\\nand_and</code>\n\n"
+                    f"<b>Подробнее:</b> <code>.vformat</code>", 
+                    parse_mode="html")
+                return
+            
+            self.enabled = True
+            self.enabled_type = "photo"
+            self._save_setting("enabled", "True")
+            self._save_setting("enabled_type", "photo")
+            await utils.answer(message, 
+                f"✅ <b>Визуальное форматирование ВКЛЮЧЕНО!</b>\n\n"
+                f"🖼️ Теперь все ваши сообщения будут превращаться в изображения.\n"
+                f"❗️ Исходное сообщение будет удалено и отправлено как фото.\n"
+                f"💬 Если вы ответили на сообщение, фото отправится с реплаем на него.\n\n"
+                f"<b>Чтобы выключить:</b> <code>.pf</code>\n"
+                f"<b>Переключиться на текстовое:</b> <code>.pf -text</code>", 
+                parse_mode="html")
+        
+        else:
+            await utils.answer(message, 
+                f"❌ <b>Неверный аргумент!</b>\n\n"
+                f"<b>Использование:</b>\n"
+                f"• <code>.pf -text</code> - включить текстовое форматирование\n"
+                f"• <code>.pf -photo</code> - включить визуальное форматирование\n"
+                f"• <code>.pf</code> - выключить форматирование", 
+                parse_mode="html")
+
+    @loader.command()
+    async def vformat(self, message: CustomMessage):
+        """🖼️ - установить шаблон визуального форматирования (генерация изображений)
+        
+        Для установки шаблона используйте .place для настройки плейсхолдеров
+        
+        Формат шаблона (вводить построчно):
+        head_{плейсхолдер}
+        body_{плейсхолдер}
+        legs_{плейсхолдер}
+        
+        Пример:
+        head_title
+        body_text
+        legs_and
+        
+        Где title, text, and - названия плейсхолдеров, которые вы установили через .place"""
+        
+        args = utils.get_args_raw(message)
+        
+        if not args:
+            template = self.vformat_template if self.vformat_template else "не установлен"
+            await utils.answer(message, 
+                f"🖼️ <b>Текущий шаблон визуального форматирования:</b>\n"
+                f"<code>{template}</code>\n\n"
+                f"<b>Использование:</b>\n"
+                f"1. Установите плейсхолдеры: <code>.place title Ваш заголовок</code>\n"
+                f"2. Установите шаблон: <code>.vformat head_title\\nbody_text\\nlegs_and</code>\n"
+                f"3. Включите: <code>.pf -photo</code>\n\n"
+                f"<b>Доступные плейсхолдеры:</b> title, text, and\n"
+                f"<b>Важно:</b> В плейсхолдере 'text' нужно использовать {{}} - оно будет заменено на текст вашего сообщения", 
+                parse_mode="html")
+            return
+        
+        self.vformat_template = args
+        self._save_setting("vformat_template", args)
+        await utils.answer(message, 
+            f"✅ <b>Шаблон визуального форматирования сохранён!</b>\n\n"
+            f"<b>Ваш шаблон:</b>\n<code>{args}</code>\n\n"
+            f"<b>Включите форматирование:</b> <code>.pf -photo</code>\n"
+            f"<b>Настройте плейсхолдеры:</b> <code>.place</code>", 
+            parse_mode="html")
+
+    @loader.command()
+    async def place(self, message: CustomMessage):
+        """📝 - установить плейсхолдер с цветом
+        
+        Использование: .place <название> [цвет] <текст>
+        
+        Цвета: red, green, blue, yellow, cyan, magenta, white, black, gray, orange, purple, pink, brown, gold, silver
+        
+        Примеры:
+        .place title blue команда: .s_mode
+        .place text white Режим отображения: ФОТО\nВсе ответы...
+        .place and gold #BestMSG
+        
+        Также можно использовать цветовые теги внутри текста: <red>красный</red> <blue>синий</blue>"""
+        
+        args = utils.get_args_raw(message)
+        
+        if not args:
+            info = f"📝 <b>Текущие плейсхолдеры:</b>\n\n"
+            for key in ["title", "text", "and"]:
+                data = self.placeholders.get(key, {"text": "не установлен", "color": None})
+                color_name = data.get("color", "default") if data.get("color") else "default"
+                info += f"• <b>{key}:</b> (цвет: {color_name})\n<code>{data.get('text', 'не установлен')[:100]}</code>\n\n"
+            
+            info += f"<b>Доступные цвета:</b> {', '.join(COLORS.keys())}\n\n"
+            info += f"<b>Примеры:</b>\n<code>.place title blue ГОЛОВА ФОТО</code>\n"
+            info += f"<code>.place text white ТЕЛО ФОТО</code>\n"
+            info += f"<code>.place and gold НИЗ ФОТО</code>"
+            
+            await utils.answer(message, info, parse_mode="html")
+            return
+        
+        parts = args.split(maxsplit=2)
+        if len(parts) < 2:
+            await utils.answer(message, f"❌ <b>Ошибка:</b> Укажите название и текст!\n\nПример: <code>.place title blue Мой текст</code>", parse_mode="html")
+            return
+        
+        placeholder = parts[0].lower()
+        
+        color = None
+        text_start = 1
+        
+        if len(parts) >= 2 and parts[1].lower() in COLORS:
+            color = parts[1].lower()
+            text_start = 2
+        
+        if text_start >= len(parts):
+            await utils.answer(message, f"❌ <b>Ошибка:</b> Укажите текст!", parse_mode="html")
+            return
+        
+        text = ' '.join(parts[text_start:])
+        
+        if placeholder not in ["title", "text", "and"]:
+            await utils.answer(message, f"❌ <b>Ошибка:</b> Доступны: title, text, and", parse_mode="html")
+            return
+        
+        self._save_placeholder(placeholder, text, color)
+        
+        color_text = f" (цвет: {color})" if color else " (цвет по умолчанию)"
+        await utils.answer(message, f"✅ <b>Плейсхолдер '{placeholder}' установлен{color_text}!</b>\n\n<code>{text[:200]}</code>", parse_mode="html")
+
+    @loader.command()
+    async def clearformat(self, message: CustomMessage):
+        """🗑️ - очистить всё форматирование
+        
+        Очищает:
+        - Шаблоны текстового форматирования
+        - Шаблоны визуального форматирования
+        - Все плейсхолдеры
+        - Фоновые изображения
+        - Символы игнорирования
+        - Выключает форматирование"""
+        
+        self.format_pattern = None
+        self.enabled = False
+        self.enabled_type = None
+        self.vformat_template = None
+        self.no_symbols = []
+        self._save_setting("format_pattern", "")
+        self._save_setting("enabled", "False")
+        self._save_setting("enabled_type", "")
+        self._save_setting("vformat_template", "")
+        self._save_setting("no_symbols", "")
+        
+        for key in ["title", "text", "and"]:
+            self._save_placeholder(key, "")
+        
+        self._save_background("text", None)
+        self.text_background = None
+        
+        await utils.answer(message, 
+            f"🗑 <b>Всё форматирование очищено!</b>\n\n"
+            f"❌ Форматирование выключено.\n\n"
+            f"💬 Чтобы установить новый текстовый шаблон: <code>.tformat &lt;шаблон&gt;</code>\n"
+            f"🖼️ Чтобы установить визуальный шаблон: <code>.vformat &lt;шаблон&gt;</code>", 
+            parse_mode="html")
+
+    async def on_unload(self):
+        """При выгрузке модуля выключаем форматирование"""
+        self.enabled = False
+        self.enabled_type = None
+        self._save_setting("enabled", "False")
+        self._save_setting("enabled_type", "")
+        self._log("❌ Модуль выгружен")
