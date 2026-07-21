@@ -1408,12 +1408,12 @@ class AIModeratorMod(loader.Module):
             duration_text = "Навсегда" if w["duration"] == 0 else f"{w['duration']}с"
             word_list.append(
                 f"• <code>{w['word']}</code> | {w['action'].upper()} | "
-                f"{duration_text} | Рейтинг: {w['rating']} | Срабатываний: {w['hits']}"
+                f"Срок: {duration_text} | Срабатываний: {w['hits']}"
             )
         text = "\n".join(word_list)
         if len(text) > 3500:
             file = io.BytesIO("\n".join([
-                f"{w['word']} | {w['action']} | {w['duration']} | {w['rating']} | {w['hits']}"
+                f"\"{w['word']}\"\n{w['action'].upper()} | Срок: {w['duration']}с | Срабатываний: {w['hits']}\n\n"
                 for w in words
             ]).encode('utf-8'))
             file.name = "forbidden_words.txt"
