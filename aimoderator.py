@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 AI Moderator Module для Userbot
-Версия 7.8: Глобальный лог-канал для всех чатов
+Версия 8.0: Добавлена поддержка JSON-папок триггеров
 """
 
 import re
@@ -11,6 +11,7 @@ import time
 import logging
 import asyncio
 import io
+import json
 import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
@@ -23,6 +24,7 @@ except NameError:
     MODULE_DIR = os.getcwd()
 
 DB_PATH = os.path.join(MODULE_DIR, "AIModeratrDB.db")
+DB_JSON_PATH = os.path.join(MODULE_DIR, "AIModeratorDBjson.db")
 
 try:
     import aiosqlite
@@ -78,39 +80,45 @@ from .. import loader
 
 @loader.tds
 class AIModeratorMod(loader.Module):
-    """AI Moderator - Модуль автоматической модерации чатов."""
+    """AI Moderator - Модуль автоматической модерации чатов с поддержкой JSON-папок."""
     
     strings = {
         "name": "AIModerator",
         "author": "YourName",
-        "version": "7.8"
+        "version": "8.0"
     }
     
     def __init__(self):
         self._initialized = False
         self._db_conn = None
+        self._db_json_conn = None
         self._bot_username = None
         self.active_punishments = {}
         self._admin_cache = {}
         self._admin_cache_time = {}
         self._cache_duration = 300
         self._tasks = []
-        self._global_log_channel = None  # Кэш глобального лог-канала
+        self._global_log_channel = None
         
     async def client_ready(self, client, db):
         """Инициализация модуля."""
         self.client = client
         
         try:
-            await self._migrate_database()
-            
+            # Основная БД
             self._db_conn = await aiosqlite.connect(DB_PATH)
             logger.info(f"✅ Подключение к БД создано: {DB_PATH}")
             
+            # JSON БД
+            self._db_json_conn = await aiosqlite.connect(DB_JSON_PATH)
+            logger.info(f"✅ Подключение к JSON БД создано: {DB_JSON_PATH}")
+            
             await self._db_conn.execute("PRAGMA journal_mode=WAL")
+            await self._db_json_conn.execute("PRAGMA journal_mode=WAL")
+            
+            await self._migrate_database()
             await self._create_tables()
             
-            # Загружаем глобальный лог-канал при старте
             self._global_log_channel = await self._get_global_log_channel()
             
             self._initialized = True
@@ -137,14 +145,10 @@ class AIModeratorMod(loader.Module):
         
         try:
             old_conn = await aiosqlite.connect(DB_PATH)
-            
-            # Проверяем структуру таблицы log_channels
             cursor = await old_conn.execute("PRAGMA table_info(log_channels)")
             columns = await cursor.fetchall()
             column_names = [c[1] for c in columns]
             
-            # Если старая структура (chat_id вместо source_chat_id) - просто удаляем,
-            # так как теперь используем global_log_channel
             if "chat_id" in column_names and "source_chat_id" not in column_names:
                 logger.warning("⚠️ Обнаружена старая структура log_channels, удаляю...")
                 await old_conn.execute("DROP TABLE IF EXISTS log_channels")
@@ -152,15 +156,15 @@ class AIModeratorMod(loader.Module):
                 logger.info("✅ Старая таблица log_channels удалена")
             
             await old_conn.close()
-            
         except Exception as e:
             logger.error(f"❌ Ошибка миграции: {e}")
     
     async def _create_tables(self):
         """Создание таблиц в БД."""
-        if not self._db_conn:
+        if not self._db_conn or not self._db_json_conn:
             return
         
+        # Основные таблицы
         tables = [
             """CREATE TABLE IF NOT EXISTS forbidden_words (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +180,6 @@ class AIModeratorMod(loader.Module):
                 enabled BOOLEAN DEFAULT 1,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""",
-            # НОВАЯ ТАБЛИЦА: глобальный лог-канал (один для всех чатов)
             """CREATE TABLE IF NOT EXISTS global_log_channel (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 log_channel_id INTEGER NOT NULL,
@@ -222,60 +225,106 @@ class AIModeratorMod(loader.Module):
         
         await self._db_conn.commit()
         logger.info("✅ Таблицы БД созданы/проверены")
+        
+        # ===== JSON таблицы =====
+        json_tables = [
+            """CREATE TABLE IF NOT EXISTS json_folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_name TEXT NOT NULL UNIQUE,
+                json_data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            """CREATE TABLE IF NOT EXISTS json_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id INTEGER,
+                word TEXT NOT NULL,
+                action TEXT NOT NULL,
+                duration INTEGER DEFAULT 0,
+                hits INTEGER DEFAULT 0,
+                FOREIGN KEY (folder_id) REFERENCES json_folders(id) ON DELETE CASCADE
+            )""",
+            """CREATE TABLE IF NOT EXISTS json_active_in_chat (
+                chat_id INTEGER,
+                folder_id INTEGER,
+                enabled BOOLEAN DEFAULT 1,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, folder_id)
+            )"""
+        ]
+        
+        for table in json_tables:
+            try:
+                await self._db_json_conn.execute(table)
+            except Exception as e:
+                logger.error(f"❌ Ошибка создания JSON таблицы: {e}")
+        
+        # Добавляем поле hits если его нет
+        try:
+            await self._db_json_conn.execute("ALTER TABLE json_words ADD COLUMN hits INTEGER DEFAULT 0")
+            await self._db_json_conn.commit()
+        except:
+            pass  # Поле уже существует
+        
+        await self._db_json_conn.commit()
+        logger.info("✅ JSON таблицы БД созданы/проверены")
     
     # ============ МЕТОДЫ РАБОТЫ С БД ============
     
-    async def _db_execute(self, query, params=None):
-        if not self._db_conn:
+    async def _db_execute(self, query, params=None, db="main"):
+        conn = self._db_conn if db == "main" else self._db_json_conn
+        if not conn:
             return None
         try:
             if params:
-                return await self._db_conn.execute(query, params)
-            return await self._db_conn.execute(query)
+                return await conn.execute(query, params)
+            return await conn.execute(query)
         except Exception as e:
             logger.error(f"❌ Ошибка SQL: {e}")
             return None
-    
-    async def _db_fetchone(self, query, params=None):
-        cursor = await self._db_execute(query, params)
+
+    async def _db_fetchone(self, query, params=None, db="main"):
+        cursor = await self._db_execute(query, params, db)
         if cursor:
             try:
                 return await cursor.fetchone()
             except:
                 pass
         return None
-    
-    async def _db_fetchall(self, query, params=None):
-        cursor = await self._db_execute(query, params)
-        if cursor:
+
+    async def _db_commit(self, db="main"):
+        conn = self._db_conn if db == "main" else self._db_json_conn
+        if conn:
             try:
-                return await cursor.fetchall()
+                await conn.commit()
             except:
                 pass
-        return []
     
-    async def _db_commit(self):
-        if self._db_conn:
-            try:
-                await self._db_commit.commit()
-            except:
-                pass
+    async def _db_fetchall(self, query, params=None, db="main"):
+        """Универсальный метод для fetchall с выбором БД"""
+        conn = self._db_conn if db == "main" else self._db_json_conn
+        if not conn:
+            return []
+        try:
+            if params:
+                cursor = await conn.execute(query, params)
+            else:
+                cursor = await conn.execute(query)
+            return await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"❌ Ошибка fetchall: {e}")
+            return []
     
     # ============ ГЛОБАЛЬНЫЙ ЛОГ-КАНАЛ ============
     
     async def _get_global_log_channel(self) -> Optional[int]:
-        """Получить ID глобального лог-канала."""
         if not self._db_conn:
             return None
         result = await self._db_fetchone(
             "SELECT log_channel_id FROM global_log_channel WHERE id = 1"
         )
-        channel_id = result[0] if result else None
-        logger.info(f"🔍 Глобальный лог-канал: {channel_id or 'НЕ УСТАНОВЛЕН'}")
-        return channel_id
+        return result[0] if result else None
     
     async def _set_global_log_channel(self, channel_id: int):
-        """Установить глобальный лог-канал."""
         if not self._db_conn:
             return
         await self._db_execute("DELETE FROM global_log_channel")
@@ -285,16 +334,13 @@ class AIModeratorMod(loader.Module):
         )
         await self._db_commit()
         self._global_log_channel = channel_id
-        logger.info(f"✅ Глобальный лог-канал установлен: {channel_id}")
     
     async def _clear_global_log_channel(self):
-        """Очистить глобальный лог-канал."""
         if not self._db_conn:
             return
         await self._db_execute("DELETE FROM global_log_channel")
         await self._db_commit()
         self._global_log_channel = None
-        logger.info("✅ Глобальный лог-канал очищен")
     
     # ============ ПРОВЕРКА АДМИНИСТРАТОРА ============
     
@@ -342,9 +388,20 @@ class AIModeratorMod(loader.Module):
     
     # ============ БИЗНЕС-ЛОГИКА ============
     
-    async def _is_chat_active(self, chat_id: int) -> bool:
+    async def _is_chat_active_for_triggers(self, chat_id: int, is_json: bool = False) -> bool:
+        """Проверка активности чата для разных типов триггеров"""
         if not self._db_conn:
             return False
+        
+        # Для JSON-триггеров проверяем только наличие активных папок
+        if is_json:
+            result = await self._db_fetchone(
+                "SELECT 1 FROM json_active_in_chat WHERE chat_id = ? AND enabled = 1 LIMIT 1",
+                (chat_id,), "json"
+            )
+            return result is not None
+        
+        # Для основных триггеров проверяем включена ли модерация
         result = await self._db_fetchone(
             "SELECT 1 FROM active_chats WHERE chat_id = ? AND enabled = 1",
             (chat_id,)
@@ -352,15 +409,51 @@ class AIModeratorMod(loader.Module):
         return result is not None
     
     async def _get_forbidden_words(self) -> List[Dict[str, Any]]:
-        if not self._db_conn:
+        """Получить все триггеры из основной БД + активные JSON папки"""
+        if not self._db_conn or not self._db_json_conn:
             return []
-        rows = await self._db_fetchall(
+        
+        # Основные триггеры
+        main_words = await self._db_fetchall(
             "SELECT word, action, duration, rating, hits FROM forbidden_words"
         )
-        return [
+        result = [
             {"word": r[0], "action": r[1], "duration": r[2], "rating": r[3], "hits": r[4]}
-            for r in rows
+            for r in main_words
         ]
+        
+        return result
+    
+    async def _get_all_triggers(self, chat_id: int) -> List[Dict[str, Any]]:
+        """Получить ВСЕ триггеры для чата (основные + активные JSON)"""
+        all_triggers = []
+        
+        # 1. Основные триггеры (всегда добавляем, но проверку будет делать watcher)
+        main = await self._get_forbidden_words()
+        all_triggers.extend(main)
+        
+        # 2. JSON триггеры из активных папок (только те, что включены через modonjson)
+        active_folders = await self._db_fetchall(
+            """SELECT f.id, f.folder_name, j.word, j.action, j.duration 
+            FROM json_active_in_chat a 
+            JOIN json_folders f ON a.folder_id = f.id 
+            JOIN json_words j ON f.id = j.folder_id 
+            WHERE a.chat_id = ? AND a.enabled = 1""",
+            (chat_id,), "json"
+        )
+        
+        for r in active_folders:
+            all_triggers.append({
+                "word": r[2],
+                "action": r[3],
+                "duration": r[4],
+                "rating": 0,
+                "hits": 0,
+                "folder_id": r[0],
+                "folder_name": r[1]
+            })
+        
+        return all_triggers
     
     async def _is_whitelisted(self, user_id: int) -> bool:
         if not self._db_conn:
@@ -396,7 +489,8 @@ class AIModeratorMod(loader.Module):
             self.active_punishments[chat_id].pop(user_id, None)
     
     async def _log_violation(self, chat_id: int, user_id: int, username: str, 
-                             trigger_word: str, action: str, duration: int):
+                            trigger_word: str, action: str, duration: int, 
+                            folder_id: Optional[int] = None):  # <-- Добавляем параметр
         if not self._db_conn:
             return
         await self._db_execute(
@@ -414,10 +508,19 @@ class AIModeratorMod(loader.Module):
                 {field} = {field} + 1""",
             (today,)
         )
-        await self._db_execute(
-            "UPDATE forbidden_words SET hits = hits + 1 WHERE word = ?",
-            (trigger_word,)
-        )
+        
+        # Обновляем hits только для основных триггеров (не JSON)
+        if folder_id is None:
+            await self._db_execute(
+                "UPDATE forbidden_words SET hits = hits + 1 WHERE word = ?",
+                (trigger_word,)
+            )
+        # Для JSON триггеров обновляем отдельно (опционально)
+        else:
+            await self._db_execute(
+                "UPDATE json_words SET hits = hits + 1 WHERE word = ? AND folder_id = ?",
+                (trigger_word, folder_id), "json"
+            )
         await self._db_commit()
     
     # ============ ФОНОВЫЕ ЗАДАЧИ ============
@@ -467,25 +570,26 @@ class AIModeratorMod(loader.Module):
                 now = datetime.now()
                 next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                 wait_seconds = (next_run - now).total_seconds()
-                await asyncio.sleep(min(wait_seconds, 3600))
+                await asyncio.sleep(min(wait_seconds, 86400))
                 
                 if not self._db_conn:
                     continue
                 
-                # Отправляем статистику в глобальный лог-канал
                 global_log = await self._get_global_log_channel()
                 if global_log:
-                    # Берем первый активный чат для генерации статистики
                     active_chat = await self._db_fetchone(
                         "SELECT chat_id FROM active_chats WHERE enabled = 1 LIMIT 1"
                     )
                     if active_chat:
                         img_data = await self._generate_stats_image(active_chat[0])
                         if img_data:
-                            await self._send_as_bot(
+                            # Отправляем как фото
+                            await self.client.send_file(
                                 global_log,
-                                io.BytesIO(img_data),
-                                "📊 **ЕЖЕДНЕВНАЯ СТАТИСТИКА**\n\nАвтоматический отчет за 24 часа"
+                                img_data,
+                                caption="📊 <b>ЕЖЕДНЕВНАЯ СТАТИСТИКА</b>\n\nАвтоматический отчет за 24 часа",
+                                parse_mode="html",
+                                force_document=False  # <-- ВАЖНО: отправляем как фото
                             )
                             today = datetime.now().strftime("%Y-%m-%d")
                             await self._db_execute("DELETE FROM daily_stats WHERE date = ?", (today,))
@@ -502,7 +606,7 @@ class AIModeratorMod(loader.Module):
     @loader.watcher(only_messages=True, no_commands=True, only_groups=True)
     async def watcher(self, message):
         """Обработчик всех входящих сообщений."""
-        if not self._initialized or not self._db_conn:
+        if not self._initialized or not self._db_conn or not self._db_json_conn:
             return
         
         try:
@@ -513,8 +617,6 @@ class AIModeratorMod(loader.Module):
                 return
             if await self._is_user_admin(chat_id, user_id):
                 return
-            if not await self._is_chat_active(chat_id):
-                return
             if await self._is_whitelisted(user_id):
                 return
             
@@ -522,23 +624,70 @@ class AIModeratorMod(loader.Module):
             if not message_text:
                 return
             
-            forbidden_words = await self._get_forbidden_words()
-            if not forbidden_words:
+            # Получаем ВСЕ триггеры (основные + JSON)
+            all_triggers = await self._get_all_triggers(chat_id)
+            if not all_triggers:
+                return
+            
+            # Разделяем основные и JSON триггеры
+            main_triggers = [t for t in all_triggers if t.get("folder_id") is None]
+            json_triggers = [t for t in all_triggers if t.get("folder_id") is not None]
+            
+            # Проверяем основные триггеры только если включена модерация
+            if main_triggers:
+                if not await self._is_chat_active_for_triggers(chat_id):
+                    main_triggers = []  # Игнорируем основные триггеры
+            
+            # JSON триггеры проверяем всегда (они уже активны через modonjson)
+            # Но проверяем, что есть активные JSON папки в этом чате
+            if json_triggers:
+                has_active_json = await self._db_fetchone(
+                    "SELECT 1 FROM json_active_in_chat WHERE chat_id = ? AND enabled = 1 LIMIT 1",
+                    (chat_id,), "json"
+                )
+                if not has_active_json:
+                    json_triggers = []  # Нет активных JSON папок
+            
+            # Объединяем доступные триггеры
+            available_triggers = main_triggers + json_triggers
+            if not available_triggers:
                 return
             
             triggered_word = None
             trigger_action = None
             trigger_duration = 0
+            trigger_folder_id = None
             
-            for word_info in forbidden_words:
-                word = word_info["word"]
-                pattern = rf"\b{re.escape(word)}\b"
-                if re.search(pattern, message_text, re.IGNORECASE):
-                    if random.random() * 100 < 80:
-                        triggered_word = word
-                        trigger_action = word_info["action"]
-                        trigger_duration = word_info["duration"]
-                        break
+            # Сортируем по длине (сначала самые длинные)
+            sorted_triggers = sorted(available_triggers, key=lambda x: len(x["word"]), reverse=True)
+            
+            # Приводим текст к нижнему регистру для поиска
+            text_lower = message_text.lower()
+            
+            for word_info in sorted_triggers:
+                word = word_info["word"].lower()
+                
+                # Проверяем вхождение слова/фразы
+                if word in text_lower:
+                    # Проверяем, что это не часть другого слова (для одиночных слов)
+                    if len(word.split()) == 1:
+                        # Для одиночных слов используем границы слова
+                        pattern = rf"(?<![а-яa-z]){re.escape(word)}(?![а-яa-z])"
+                        if re.search(pattern, text_lower, re.IGNORECASE):
+                            if random.random() * 100 < 80:
+                                triggered_word = word_info["word"]
+                                trigger_action = word_info["action"]
+                                trigger_duration = word_info["duration"]
+                                trigger_folder_id = word_info.get("folder_id")
+                                break
+                    else:
+                        # Для фраз просто проверяем вхождение
+                        if random.random() * 100 < 80:
+                            triggered_word = word_info["word"]
+                            trigger_action = word_info["action"]
+                            trigger_duration = word_info["duration"]
+                            trigger_folder_id = word_info.get("folder_id")
+                            break
             
             if not triggered_word:
                 return
@@ -579,19 +728,18 @@ class AIModeratorMod(loader.Module):
                         username = sender.username
                 except:
                     pass
-                
+
                 await self._log_violation(
                     chat_id=chat_id, user_id=user_id,
                     username=username or str(user_id),
                     trigger_word=triggered_word,
-                    action=trigger_action, duration=trigger_duration
+                    action=trigger_action, duration=trigger_duration,
+                    folder_id=trigger_folder_id
                 )
                 
-                # ===== ВАЖНО: Используем ГЛОБАЛЬНЫЙ лог-канал =====
-                global_log = self._global_log_channel  # Используем кэш
+                global_log = self._global_log_channel
                 
                 if global_log:
-                    logger.info(f"📤 Отправка лога в глобальный лог-канал {global_log}")
                     await self._send_log_with_buttons(
                         target_chat=global_log,
                         user_id=user_id, username=username,
@@ -602,7 +750,6 @@ class AIModeratorMod(loader.Module):
                         action=trigger_action, duration=trigger_duration
                     )
                 else:
-                    logger.info(f"📤 Глобальный лог-канал не установлен, отправка в Избранное")
                     await self._send_log_with_buttons(
                         target_chat="me",
                         user_id=user_id, username=username,
@@ -619,12 +766,24 @@ class AIModeratorMod(loader.Module):
     # ============ ОТПРАВКА СООБЩЕНИЙ ============
     
     async def _send_log_with_buttons(self, target_chat, user_id: int, 
-                                      username: str, source_chat_id: int, chat_title: str,
-                                      message_text: str, trigger_word: str,
-                                      action: str, duration: int):
+                                    username: str, source_chat_id: int, chat_title: str,
+                                    message_text: str, trigger_word: str,
+                                    action: str, duration: int):
         """Отправка лога с кнопками."""
         try:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Получаем имя пользователя
+            user_name = "не указано"
+            try:
+                user_entity = await self.client.get_entity(user_id)
+                if user_entity:
+                    if hasattr(user_entity, 'first_name'):
+                        user_name = user_entity.first_name or "не указано"
+                        if hasattr(user_entity, 'last_name') and user_entity.last_name:
+                            user_name += f" {user_entity.last_name}"
+            except:
+                pass
             
             if duration == 0:
                 duration_text = "Навсегда"
@@ -640,6 +799,7 @@ class AIModeratorMod(loader.Module):
             log_text = (
                 f"🚨 <b>НАРУШЕНИЕ ОБНАРУЖЕНО</b> 🚨\n\n"
                 f"👤 <b>Нарушитель:</b>\n"
+                f"   • Имя: <b>{user_name}</b>\n"
                 f"   • ID: <code>{user_id}</code>\n"
                 f"   • Username: @{username or 'не указан'}\n\n"
                 f"💬 <b>Чат:</b>\n"
@@ -661,14 +821,12 @@ class AIModeratorMod(loader.Module):
                 ]
             ]
             
-            logger.info(f"📨 Отправка сообщения в {target_chat}")
             await self.client.send_message(
                 target_chat, 
                 log_text, 
                 parse_mode="html", 
                 buttons=buttons
             )
-            logger.info(f"✅ Лог успешно отправлен в {target_chat}")
             
         except Exception as e:
             logger.error(f"❌ Ошибка отправки лога в {target_chat}: {e}")
@@ -680,18 +838,17 @@ class AIModeratorMod(loader.Module):
                 await self.client.send_file(chat_id, file, caption=text or "", parse_mode=parse_mode, buttons=buttons)
             else:
                 await self.client.send_message(chat_id, text or "", parse_mode=parse_mode, buttons=buttons)
-            logger.info(f"✅ Отправлено в {chat_id}")
         except Exception as e:
             logger.error(f"❌ Ошибка отправки в {chat_id}: {e}")
     
     # ============ ГЕНЕРАЦИЯ СТАТИСТИКИ ============
     
-    async def _generate_stats_image(self, chat_id: int) -> Optional[bytes]:
+    async def _generate_stats_image(self, chat_id: int) -> Optional[io.BytesIO]:
         """Генерация изображения статистики."""
         try:
-            words = await self._get_forbidden_words()
-            total_triggers = len(words)
-            total_hits = sum(w["hits"] for w in words)
+            all_triggers = await self._get_all_triggers(chat_id)
+            total_triggers = len(all_triggers)
+            total_hits = sum(w.get("hits", 0) for w in all_triggers)
             
             today = datetime.now().strftime("%Y-%m-%d")
             
@@ -772,29 +929,394 @@ class AIModeratorMod(loader.Module):
                 y_pos += 30
             
             y_pos += 10
-            if words:
+            if all_triggers:
                 draw.line([(50, y_pos), (width-50, y_pos)], fill=colors[2], width=1)
                 y_pos += 20
                 draw.text((50, y_pos), "🏆 ТОП-3 ТРИГГЕРА:", fill=colors[2], font=font_header)
                 y_pos += 35
                 
-                sorted_words = sorted(words, key=lambda x: x["hits"], reverse=True)[:3]
+                sorted_words = sorted(all_triggers, key=lambda x: x.get("hits", 0), reverse=True)[:3]
                 for i, w in enumerate(sorted_words, 1):
-                    rating_text = "👍" if w["rating"] > 0 else "👎" if w["rating"] < 0 else "⚖️"
-                    line_text = f"{i}. {w['word']} - {w['hits']} раз(а) | {w['action'].upper()} | {w['rating']} {rating_text}"
+                    rating_text = "👍" if w.get("rating", 0) > 0 else "👎" if w.get("rating", 0) < 0 else "⚖️"
+                    line_text = f"{i}. {w['word']} - {w.get('hits', 0)} раз(а) | {w['action'].upper()} | {w.get('rating', 0)} {rating_text}"
                     draw.text((70, y_pos), line_text, fill=colors[i % len(colors)], font=font_small)
                     y_pos += 28
             
+            # Сохраняем изображение в BytesIO
             img_bytes = io.BytesIO()
             image.save(img_bytes, format='PNG')
             img_bytes.seek(0)
-            return img_bytes.getvalue()
+            
+            # Устанавливаем имя файла для определения как изображение
+            img_bytes.name = "stats.png"
+            
+            return img_bytes
             
         except Exception as e:
             logger.error(f"❌ Ошибка генерации статистики: {e}")
             return None
     
-    # ============ КОМАНДЫ ============
+    # ============ JSON КОМАНДЫ ============
+    
+    @loader.command(alias="modaddjson")
+    async def modaddjson(self, message):
+        """
+        .modaddjson [название] - добавить триггеры из JSON файла (реплай на .json файл)
+        
+        Формат JSON:
+        {
+            "слово1": {"действие": время},
+            "слово2": {"действие": время}
+        }
+        
+        Действия: кик, мут, бан
+        Время: в секундах (0 = навсегда)
+        """
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.edit(
+                "<b>❌ Использование:</b>\n"
+                "<code>.modaddjson [название]</code>\n"
+                "<i>Ответьте на .json файл</i>",
+                parse_mode="html"
+            )
+            return
+        
+        folder_name = args[1].strip()
+        
+        if not message.is_reply:
+            await message.edit("<b>❌ Ответьте на .json файл!</b>", parse_mode="html")
+            return
+        
+        reply = await message.get_reply_message()
+        if not reply.file or not reply.file.name.endswith('.json'):
+            await message.edit("<b>❌ Ответьте на файл с расширением .json!</b>", parse_mode="html")
+            return
+        
+        await message.edit("<b>⏳ Обработка JSON файла...</b>", parse_mode="html")
+        
+        try:
+            json_data = await reply.download_media(bytes)
+            data = json.loads(json_data.decode('utf-8'))
+            
+            if not isinstance(data, dict):
+                await message.edit("<b>❌ JSON должен быть словарем!</b>", parse_mode="html")
+                return
+            
+            # Проверяем, существует ли уже такая папка
+            existing = await self._db_fetchone(
+                "SELECT id FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            
+            if existing:
+                # Обновляем существующую папку
+                await self._db_execute(
+                    "DELETE FROM json_words WHERE folder_id = ?",
+                    (existing[0],), "json"
+                )
+                await self._db_execute(
+                    "UPDATE json_folders SET json_data = ? WHERE folder_name = ?",
+                    (json_data.decode('utf-8'), folder_name), "json"
+                )
+                folder_id = existing[0]
+            else:
+                # Создаем новую папку
+                await self._db_execute(
+                    "INSERT INTO json_folders (folder_name, json_data) VALUES (?, ?)",
+                    (folder_name, json_data.decode('utf-8')), "json"
+                )
+                folder_id = await self._db_fetchone(
+                    "SELECT id FROM json_folders WHERE folder_name = ?",
+                    (folder_name,), "json"
+                )
+                folder_id = folder_id[0] if folder_id else None
+            
+            if not folder_id:
+                await message.edit("<b>❌ Ошибка создания папки!</b>", parse_mode="html")
+                return
+            
+            # Парсим и добавляем слова
+            added = 0
+            errors = 0
+            error_list = []
+            
+            for word, action_data in data.items():
+                if not isinstance(action_data, dict):
+                    errors += 1
+                    error_list.append(f"⚠️ {word}: неверный формат (не словарь)")
+                    continue
+                
+                action = None
+                duration = 0
+                
+                for act, dur in action_data.items():
+                    if act.lower() in ["кик", "мут", "бан"]:
+                        action = act.lower()
+                        try:
+                            duration = int(dur)
+                        except:
+                            duration = 0
+                        break
+                
+                if not action:
+                    errors += 1
+                    error_list.append(f"⚠️ {word}: действие не распознано (кик/мут/бан)")
+                    continue
+                
+                await self._db_execute(
+                    "INSERT INTO json_words (folder_id, word, action, duration) VALUES (?, ?, ?, ?)",
+                    (folder_id, word.lower(), action, duration), "json"
+                )
+                added += 1
+            
+            await self._db_commit("json")
+            
+            result_text = f"<b>✅ Папка '{folder_name}' создана/обновлена!</b>\n"
+            result_text += f"📦 Добавлено триггеров: {added}\n"
+            if errors > 0:
+                result_text += f"⚠️ Ошибок: {errors}\n\n"
+                result_text += "\n".join(error_list[:5])
+                if len(error_list) > 5:
+                    result_text += f"\n... и еще {len(error_list) - 5} ошибок"
+            
+            await message.edit(result_text, parse_mode="html")
+            
+        except json.JSONDecodeError as e:
+            await message.edit(f"<b>❌ Ошибка парсинга JSON: {e}</b>", parse_mode="html")
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    @loader.command(alias="moddeljson")
+    async def moddeljson(self, message):
+        """
+        .moddeljson [название] - удалить папку триггеров
+        """
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.edit(
+                "<b>❌ Использование:</b>\n"
+                "<code>.moddeljson [название]</code>",
+                parse_mode="html"
+            )
+            return
+        
+        folder_name = args[1].strip()
+        
+        try:
+            # Проверяем существование папки
+            folder = await self._db_fetchone(
+                "SELECT id FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            
+            if not folder:
+                await message.edit(f"<b>❌ Папка '{folder_name}' не найдена!</b>", parse_mode="html")
+                return
+            
+            # Удаляем папку (каскадно удалятся все слова и связи)
+            await self._db_execute(
+                "DELETE FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            await self._db_commit("json")
+            
+            await message.edit(
+                f"<b>✅ Папка '{folder_name}' удалена!</b>\n"
+                f"<i>Все триггеры из этой папки больше не активны.</i>",
+                parse_mode="html"
+            )
+            
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    @loader.command(alias="modjson")
+    async def modjson(self, message):
+        """
+        .modjson [название] - получить JSON файл папки триггеров
+        """
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.edit(
+                "<b>❌ Использование:</b>\n"
+                "<code>.modjson [название]</code>",
+                parse_mode="html"
+            )
+            return
+        
+        folder_name = args[1].strip()
+        
+        try:
+            folder = await self._db_fetchone(
+                "SELECT json_data FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            
+            if not folder:
+                await message.edit(f"<b>❌ Папка '{folder_name}' не найдена!</b>", parse_mode="html")
+                return
+            
+            json_str = folder[0]
+            file = io.BytesIO(json_str.encode('utf-8'))
+            file.name = f"{folder_name}.json"
+            
+            await message.delete()
+            await self.client.send_file(
+                message.chat_id,
+                file,
+                caption=f"<b>📦 JSON файл папки '{folder_name}'</b>",
+                parse_mode="html"
+            )
+            
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    @loader.command(alias="modonjson")
+    async def modonjson(self, message):
+        """
+        .modonjson [название] - включить папку триггеров в текущем чате
+        """
+        if not message.is_group and not message.is_channel:
+            await message.edit("<b>❌ Эта команда работает только в группах/каналах</b>", parse_mode="html")
+            return
+        
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.edit(
+                "<b>❌ Использование:</b>\n"
+                "<code>.modonjson [название]</code>",
+                parse_mode="html"
+            )
+            return
+        
+        folder_name = args[1].strip()
+        chat_id = message.chat_id
+        
+        try:
+            folder = await self._db_fetchone(
+                "SELECT id FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            
+            if not folder:
+                await message.edit(f"<b>❌ Папка '{folder_name}' не найдена!</b>", parse_mode="html")
+                return
+            
+            folder_id = folder[0]
+            
+            # Включаем папку для чата
+            await self._db_execute(
+                "INSERT OR REPLACE INTO json_active_in_chat (chat_id, folder_id, enabled) VALUES (?, ?, 1)",
+                (chat_id, folder_id), "json"
+            )
+            await self._db_commit("json")
+            
+            # Получаем количество триггеров в папке
+            count = await self._db_fetchone(
+                "SELECT COUNT(*) FROM json_words WHERE folder_id = ?",
+                (folder_id,), "json"
+            )
+            count = count[0] if count else 0
+            
+            await message.edit(
+                f"<b>✅ Папка '{folder_name}' включена в этом чате!</b>\n"
+                f"📦 Триггеров в папке: {count}",
+                parse_mode="html"
+            )
+            
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    @loader.command(alias="modoffjson")
+    async def modoffjson(self, message):
+        """
+        .modoffjson [название] - отключить папку триггеров в текущем чате
+        """
+        if not message.is_group and not message.is_channel:
+            await message.edit("<b>❌ Эта команда работает только в группах/каналах</b>", parse_mode="html")
+            return
+        
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.edit(
+                "<b>❌ Использование:</b>\n"
+                "<code>.modoffjson [название]</code>",
+                parse_mode="html"
+            )
+            return
+        
+        folder_name = args[1].strip()
+        chat_id = message.chat_id
+        
+        try:
+            folder = await self._db_fetchone(
+                "SELECT id FROM json_folders WHERE folder_name = ?",
+                (folder_name,), "json"
+            )
+            
+            if not folder:
+                await message.edit(f"<b>❌ Папка '{folder_name}' не найдена!</b>", parse_mode="html")
+                return
+            
+            folder_id = folder[0]
+            
+            # Отключаем папку для чата
+            await self._db_execute(
+                "UPDATE json_active_in_chat SET enabled = 0 WHERE chat_id = ? AND folder_id = ?",
+                (chat_id, folder_id), "json"
+            )
+            await self._db_commit("json")
+            
+            await message.edit(
+                f"<b>✅ Папка '{folder_name}' отключена в этом чате!</b>",
+                parse_mode="html"
+            )
+            
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    @loader.command(alias="modlistjson")
+    async def modlistjson(self, message):
+        """
+        .modlistjson - список всех папок триггеров
+        """
+        try:
+            folders = await self._db_fetchall(
+                "SELECT folder_name, created_at, (SELECT COUNT(*) FROM json_words WHERE folder_id = json_folders.id) as count FROM json_folders",
+                None, "json"
+            )
+            
+            if not folders:
+                await message.edit(
+                    "<b>📋 Папки триггеров не найдены</b>\n"
+                    "<i>Создайте первую папку через .modaddjson</i>",
+                    parse_mode="html"
+                )
+                return
+            
+            # Получаем активные папки в текущем чате
+            chat_id = message.chat_id
+            active_folders = await self._db_fetchall(
+                "SELECT f.folder_name FROM json_active_in_chat a JOIN json_folders f ON a.folder_id = f.id WHERE a.chat_id = ? AND a.enabled = 1",
+                (chat_id,), "json"
+            )
+            active_names = [f[0] for f in active_folders]
+            
+            text = f"<b>📋 Папки триггеров ({len(folders)})</b>\n\n"
+            
+            for folder in folders:
+                name = folder[0]
+                created = folder[1][:10] if folder[1] else "unknown"
+                count = folder[2] or 0
+                status = "✅" if name in active_names else "❌"
+                text += f"{status} <b>{name}</b> — {count} триггеров (создана: {created})\n"
+            
+            await message.edit(text, parse_mode="html")
+            
+        except Exception as e:
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+    
+    # ============ ОСНОВНЫЕ КОМАНДЫ ============
     
     @loader.command(alias="modon")
     async def modon(self, message):
@@ -960,37 +1482,180 @@ class AIModeratorMod(loader.Module):
         await self._db_execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
         await self._db_commit()
         await message.edit(f"<b>✅ Удален из белого списка</b>\nID: <code>{user_id}</code>", parse_mode="html")
+
+    @loader.command(alias="modwllist")
+    async def modwllist(self, message):
+        """
+        .modwllist - показать белый список пользователей
+        
+        Показывает всех пользователей в белом списке с их ID, именем и @username
+        """
+        try:
+            # Получаем всех пользователей из белого списка
+            whitelist_users = await self._db_fetchall(
+                "SELECT user_id, added_by, added_at FROM whitelist ORDER BY added_at DESC"
+            )
+            
+            if not whitelist_users:
+                await message.edit(
+                    "<b>📋 Белый список пуст</b>\n\n"
+                    "<i>Добавьте пользователей через .modwl</i>",
+                    parse_mode="html"
+                )
+                return
+            
+            await message.edit("<b>⏳ Загрузка информации о пользователях...</b>", parse_mode="html")
+            
+            user_list = []
+            user_info_cache = {}
+            
+            for user_id, added_by, added_at in whitelist_users:
+                # Пытаемся получить информацию о пользователе
+                user_info = None
+                username = None
+                first_name = None
+                last_name = None
+                
+                # Проверяем кэш
+                if user_id in user_info_cache:
+                    user_info = user_info_cache[user_id]
+                else:
+                    try:
+                        user_entity = await self.client.get_entity(user_id)
+                        if user_entity:
+                            username = user_entity.username if hasattr(user_entity, 'username') else None
+                            first_name = user_entity.first_name if hasattr(user_entity, 'first_name') else None
+                            last_name = user_entity.last_name if hasattr(user_entity, 'last_name') else None
+                            user_info = {
+                                "username": username,
+                                "first_name": first_name,
+                                "last_name": last_name
+                            }
+                            user_info_cache[user_id] = user_info
+                    except Exception as e:
+                        logger.debug(f"Не удалось получить информацию о пользователе {user_id}: {e}")
+                        user_info = {"username": None, "first_name": None, "last_name": None}
+                        user_info_cache[user_id] = user_info
+                
+                # Формируем имя пользователя
+                if user_info:
+                    full_name = ""
+                    if user_info["first_name"]:
+                        full_name += user_info["first_name"]
+                    if user_info["last_name"]:
+                        full_name += f" {user_info['last_name']}"
+                    if not full_name:
+                        full_name = "Неизвестно"
+                    username_display = f"@{user_info['username']}" if user_info["username"] else "без username"
+                else:
+                    full_name = "Неизвестно"
+                    username_display = "без username"
+                
+                # Форматируем дату добавления
+                added_date = added_at[:10] if added_at else "неизвестно"
+                
+                user_list.append(
+                    f"👤 <code>{user_id}</code> <b>|</b> <code>{full_name}</code> <b>|</b> {username_display} <b>|</b> <code>{added_date}</code>\n"
+                )
+            
+            # Формируем итоговое сообщение
+            total_users = len(user_list)
+            result_text = f"<b>📋 БЕЛЫЙ СПИСОК ({total_users})</b>\n\n"
+            result_text += "\n".join(user_list)
+            
+            # Если сообщение слишком длинное, отправляем файлом
+            if len(result_text) > 2000:
+                file_content = f"БЕЛЫЙ СПИСОК ({total_users})\n\n"
+                file_content += "=" * 50 + "\n\n"
+                
+                for i, (user_id, added_by, added_at) in enumerate(whitelist_users, 1):
+                    user_info = user_info_cache.get(user_id, {})
+                    full_name = ""
+                    if user_info.get("first_name"):
+                        full_name += user_info["first_name"]
+                    if user_info.get("last_name"):
+                        full_name += f" {user_info['last_name']}"
+                    if not full_name:
+                        full_name = "Неизвестно"
+                    
+                    username_display = user_info.get("username") or "без username"
+                    added_date = added_at[:10] if added_at else "неизвестно"
+                    
+                    file_content += f"{i}. ID: {user_id}\n"
+                    file_content += f"   Имя: {full_name}\n"
+                    file_content += f"   Username: @{username_display}\n"
+                    file_content += f"   Добавлен: {added_date}\n\n"
+                
+                file = io.BytesIO(file_content.encode('utf-8'))
+                file.name = "whitelist.txt"
+                
+                await message.delete()
+                await self.client.send_file(
+                    message.chat_id,
+                    file,
+                    caption=f"<b>📋 БЕЛЫЙ СПИСОК ({total_users})</b>",
+                    parse_mode="html"
+                )
+            else:
+                await message.edit(result_text, parse_mode="html")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка в modwllist: {e}")
+            await message.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+
+    @loader.command(alias="modwlclear")
+    async def modwlclear(self, message):
+        """
+        .modwlclear - ОЧИСТИТЬ весь белый список
+        
+        ВНИМАНИЕ: Это действие необратимо!
+        """
+        # Проверяем подтверждение
+        await message.edit(
+            f"<b>⚠️ ВНИМАНИЕ!</b>\n\n"
+            "Вы уверены, что хотите ОЧИСТИТЬ весь белый список?\n"
+            "Это действие НЕОБРАТИМО!\n\n"
+            "Для подтверждения отправьте точное сообщение:\n"
+            f"<code>.modwlclear confirm</code>",
+            parse_mode="html"
+        )
+        
+        # Ждем ответа с подтверждением
+        @self.client.on(events.NewMessage(chats=message.chat_id, from_users=message.sender_id))
+        async def wait_for_confirm(event):
+            if event.text and event.text.strip() == ".modwlclear confirm":
+                try:
+                    await self._db_execute("DELETE FROM whitelist")
+                    await self._db_commit()
+                    await event.edit("<b>✅ Белый список полностью очищен!</b>", parse_mode="html")
+                except Exception as e:
+                    await event.edit(f"<b>❌ Ошибка: {e}</b>", parse_mode="html")
+                finally:
+                    # Отписываемся от события
+                    self.client.remove_event_handler(wait_for_confirm)
+            elif event.text and event.text.strip().startswith(".modwlclear"):
+                pass  # Игнорируем другие команды
+            else:
+                await event.edit("<b>❌ Подтверждение не получено. Очистка отменена.</b>", parse_mode="html")
+                self.client.remove_event_handler(wait_for_confirm)
     
     @loader.command(alias="setlog")
     async def setlog(self, message):
-        """
-        Установить ГЛОБАЛЬНЫЙ чат для логов.
-        Все логи со ВСЕХ чатов будут отправляться в этот чат.
-        Использование: .setlog [ID чата] (или .setlog для текущего чата)
-        """
+        """Установить глобальный чат для логов"""
         args = message.text.split(maxsplit=1)
-        
         log_channel_id = message.chat_id
-        
         if len(args) > 1 and args[1].strip().lstrip("-").isdigit():
             log_channel_id = int(args[1].strip())
-        
         await self._set_global_log_channel(log_channel_id)
-        
         await message.edit(
-            f"<b>✅ ГЛОБАЛЬНЫЙ чат для логов установлен!</b>\n\n"
-            f"📨 <b>Все логи будут отправляться в:</b> <code>{log_channel_id}</code>\n\n"
-            f"<i>Логи со всех чатов, где включена модерация, будут приходить сюда.</i>",
+            f"<b>✅ Глобальный чат для логов установлен!</b>\n"
+            f"📨 <b>Все логи будут отправляться в:</b> <code>{log_channel_id}</code>",
             parse_mode="html"
         )
-        logger.info(f"✅ setlog: глобальный лог-канал = {log_channel_id}")
     
     @loader.command(alias="unsetlog")
     async def unsetlog(self, message):
-        """
-        Отвязать глобальный чат для логов.
-        Логи будут приходить в Избранное.
-        """
+        """Отвязать глобальный чат для логов"""
         await self._clear_global_log_channel()
         await message.edit(
             f"<b>✅ Глобальный лог-чат отвязан!</b>\n"
@@ -1002,11 +1667,10 @@ class AIModeratorMod(loader.Module):
     async def modstatus(self, message):
         """Проверка статуса AIModerator"""
         chat_id = message.chat_id
-        is_active = await self._is_chat_active(chat_id)
+        is_active = await self._is_chat_active_for_triggers(chat_id)
         words = await self._get_forbidden_words()
         total_hits = sum(w["hits"] for w in words)
         
-        # Получаем количество активных чатов
         active_chats = await self._db_fetchall(
             "SELECT COUNT(*) FROM active_chats WHERE enabled = 1"
         )
@@ -1038,15 +1702,16 @@ class AIModeratorMod(loader.Module):
         
         img_data = await self._generate_stats_image(chat_id)
         if img_data:
-            # Отправляем в глобальный лог-канал или в Избранное
             target = self._global_log_channel if self._global_log_channel else "me"
             target_name = f"глобальный лог-чат {target}" if self._global_log_channel else "Избранное"
             
-            await self._send_as_bot(
+            # Отправляем как фото
+            await self.client.send_file(
                 target,
-                file=io.BytesIO(img_data),
-                text=f"📊 <b>СТАТИСТИКА МОДЕРАТОРА</b>\n\nРучной запрос из чата <code>{chat_id}</code>",
-                parse_mode="html"
+                img_data,
+                caption=f"📊 <b>СТАТИСТИКА МОДЕРАТОРА</b>\n\nРучной запрос из чата <code>{chat_id}</code>",
+                parse_mode="html",
+                force_document=False  # <-- ВАЖНО: отправляем как фото, а не документ
             )
             await message.edit(f"<b>✅ Статистика отправлена в {target_name}!</b>", parse_mode="html")
         else:
@@ -1084,7 +1749,13 @@ class AIModeratorMod(loader.Module):
         if self._db_conn:
             try:
                 await self._db_conn.close()
-                logger.info("🔒 Подключение к БД закрыто")
+                logger.info("🔒 Подключение к основной БД закрыто")
+            except:
+                pass
+        if self._db_json_conn:
+            try:
+                await self._db_json_conn.close()
+                logger.info("🔒 Подключение к JSON БД закрыто")
             except:
                 pass
         logger.info("🔒 AIModerator выгружен")
